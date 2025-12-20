@@ -122,5 +122,5 @@ watchfiles==1.1.1
 websockets==15.0.1
 yarl==1.22.0
 zipp==3.23.0
-Add gunicorn for production server
+gunicorn
 gunicorn==21.2.0
