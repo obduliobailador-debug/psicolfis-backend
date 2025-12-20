@@ -1,3 +1,5 @@
+import stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -10,7 +12,6 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -111,28 +112,37 @@ async def get_status_checks():
     return status_checks
 
 # Stripe Checkout Endpoints
-@api_router.post("/checkout/session")
-async def create_checkout_session(request: CheckoutRequest, http_request: Request):
+@api_router.get("/checkout/status/{session_id}")
+async def get_checkout_status(session_id: str):
     try:
-        # Validate agent_id
-        agent_id_lower = request.agent_id.lower()
-        if agent_id_lower not in AGENT_PACKAGES:
-            raise HTTPException(status_code=400, detail="Invalid agent ID")
-        
-        # Get fixed price from server-side definition
-        agent_info = AGENT_PACKAGES[agent_id_lower]
-        amount = agent_info["price"]
-        
-        # Build dynamic URLs from provided origin
-        success_url = f"{request.origin_url}/success?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{request.origin_url}/cancel"
-        
-        # Initialize Stripe
-        stripe_api_key = os.environ.get('STRIPE_API_KEY')
-        if not stripe_api_key:
-            raise HTTPException(status_code=500, detail="Stripe API key not configured")
-        
-        host_url = str(http_request.base_url)
+        session = stripe.checkout.Session.retrieve(session_id)
+
+        # Update DB if paid
+        if session.payment_status == "paid":
+            existing = await db.payment_transactions.find_one({"session_id": session_id})
+
+            if existing and existing.get("payment_status") != "paid":
+                await db.payment_transactions.update_one(
+                    {"session_id": session_id},
+                    {
+                        "$set": {
+                            "payment_status": "paid",
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        }
+                    }
+                )
+
+        return {
+            "status": session.status,
+            "payment_status": session.payment_status,
+            "amount_total": session.amount_total,
+            "currency": session.currency,
+            "metadata": session.metadata
+        }
+
+    except Exception as e:
+        logger.error(f"Error checking payment status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
         webhook_url = f"{host_url}api/webhook/stripe"
         stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url=webhook_url)
         
@@ -243,52 +253,34 @@ async def get_checkout_status(session_id: str):
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
     try:
-        body = await request.body()
-        signature = request.headers.get("Stripe-Signature")
-        
-        if not signature:
-            raise HTTPException(status_code=400, detail="Missing Stripe signature")
-        
-        # Initialize Stripe
-        stripe_api_key = os.environ.get('STRIPE_API_KEY')
-        if not stripe_api_key:
-            raise HTTPException(status_code=500, detail="Stripe API key not configured")
-        
-        stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url="")
-        
-        # Handle webhook
-        webhook_response = await stripe_checkout.handle_webhook(body, signature)
-        
-        # Update database based on webhook event
-        if webhook_response.event_type == "checkout.session.completed":
+        payload = await request.body()
+        sig_header = request.headers.get("Stripe-Signature")
+        endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+        if not endpoint_secret:
+            raise HTTPException(status_code=500, detail="Webhook secret not configured")
+
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+
+        if event["type"] == "checkout.session.completed":
+            session = event["data"]["object"]
+
             await db.payment_transactions.update_one(
-                {"session_id": webhook_response.session_id},
+                {"session_id": session["id"]},
                 {
                     "$set": {
-                        "payment_status": webhook_response.payment_status,
+                        "payment_status": session["payment_status"],
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }
                 }
             )
-            logger.info(f"Webhook processed for session {webhook_response.session_id}")
-        
-        return JSONResponse(content={"status": "success"}, status_code=200)
-        
+
+            logger.info(f"Webhook processed for session {session['id']}")
+
+        return {"status": "success"}
+
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}")
+        logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-
-# Include the router in the main app
-app.include_router(api_router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
