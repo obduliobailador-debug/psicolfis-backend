@@ -4,6 +4,7 @@ import uuid
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from fastapi import FastAPI, APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
@@ -19,24 +20,20 @@ load_dotenv(ROOT_DIR / '.env')
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Initialize Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-# MongoDB connection (guarded for deploy issues)
-mongo_url = os.getenv('MONGO_URL')
-db = None
-if mongo_url:
-    try:
-        client = AsyncIOMotorClient(mongo_url)
-        db = client[os.getenv('DB_NAME')]
-    except Exception as e:
-        logger.error(f"Could not connect to MongoDB: {e}")
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
 
-# FastAPI app
+# =========================
+# FASTAPI APP
+# =========================
 app = FastAPI()
 
 # Redirect root → /api
@@ -46,7 +43,9 @@ async def redirect_to_api():
 
 api_router = APIRouter(prefix="/api")
 
-# Models
+# =========================
+# MODELS
+# =========================
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -71,7 +70,9 @@ class PaymentTransaction(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# Agents
+# =========================
+# AGENTS
+# =========================
 AGENT_PACKAGES = {
     "iris": {
         "name": "IRIS",
@@ -93,34 +94,31 @@ AGENT_PACKAGES = {
     }
 }
 
-# Routes
+# =========================
+# ROUTES
+# =========================
 @api_router.get("/")
 async def api_home():
     return {"message": "API Psicolfis Online"}
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not connected")
     status_obj = StatusCheck(**input.model_dump())
     doc = status_obj.model_dump()
     doc['timestamp'] = doc['timestamp'].isoformat()
     await db.status_checks.insert_one(doc)
     return status_obj
 
-@api_router.get("/status")
+@api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
-    # Simplified fallback version
-    if db is None:
-        return {"message": "Database connection not available (test fallback)."}
     try:
         results = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
         for item in results:
-            if isinstance(item['timestamp'], str):
+            if isinstance(item.get('timestamp'), str):
                 item['timestamp'] = datetime.fromisoformat(item['timestamp'])
         return results
     except Exception as e:
-        logger.error(f"Status check error: {str(e)}")
+        logger.error(f"Error accessing status data: {str(e)}")
         raise HTTPException(status_code=500, detail="Error accessing status data")
 
 @api_router.post("/checkout/session")
@@ -132,7 +130,6 @@ async def create_checkout_session(request: CheckoutRequest):
 
         agent = AGENT_PACKAGES[agent_id]
         amount = agent["price"]
-
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
@@ -153,24 +150,22 @@ async def create_checkout_session(request: CheckoutRequest):
             }
         )
 
-        if db:
-            transaction = PaymentTransaction(
-                session_id=session.id,
-                agent_id=agent_id,
-                amount=amount,
-                currency="eur",
-                payment_status="pending",
-                metadata={
-                    "agent_name": agent["name"],
-                    "source": "web_checkout",
-                    "stripe_product_id": agent["stripe_product_id"]
-                }
-            )
-            doc = transaction.model_dump()
-            doc['created_at'] = doc['created_at'].isoformat()
-            doc['updated_at'] = doc['updated_at'].isoformat()
-            await db.payment_transactions.insert_one(doc)
-
+        transaction = PaymentTransaction(
+            session_id=session.id,
+            agent_id=agent_id,
+            amount=amount,
+            currency="eur",
+            payment_status="pending",
+            metadata={
+                "agent_name": agent["name"],
+                "source": "web_checkout",
+                "stripe_product_id": agent["stripe_product_id"]
+            }
+        )
+        doc = transaction.model_dump()
+        doc['created_at'] = doc['created_at'].isoformat()
+        doc['updated_at'] = doc['updated_at'].isoformat()
+        await db.payment_transactions.insert_one(doc)
         return {"url": session.url, "session_id": session.id}
     except Exception as e:
         logger.error(f"Error creating checkout session: {str(e)}")
@@ -180,7 +175,7 @@ async def create_checkout_session(request: CheckoutRequest):
 async def get_checkout_status(session_id: str):
     try:
         session = stripe.checkout.Session.retrieve(session_id)
-        if db and session.payment_status == "paid":
+        if session.payment_status == "paid":
             await db.payment_transactions.update_one(
                 {"session_id": session_id},
                 {"$set": {
@@ -209,7 +204,7 @@ async def stripe_webhook(request: Request):
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
         event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-        if event["type"] == "checkout.session.completed" and db:
+        if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
             await db.payment_transactions.update_one(
                 {"session_id": session["id"]},
@@ -223,7 +218,9 @@ async def stripe_webhook(request: Request):
         logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# Register router & CORS
+# =========================
+# REGISTER ROUTER & CORS
+# =========================
 app.include_router(api_router)
 
 app.add_middleware(
@@ -233,6 +230,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
     if client is not None:
