@@ -1,11 +1,12 @@
 import stripe
 import os
+import uuid
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from fastapi import FastAPI, APIRouter, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -30,17 +31,22 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
-from fastapi.responses import RedirectResponse
 
+# =========================
+# FASTAPI APP
+# =========================
+app = FastAPI()
+
+# Redirect root → /api
 @app.get("/")
 async def redirect_to_api():
     return RedirectResponse(url="/api/")
 
-# FastAPI app and router
-app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Models
+# =========================
+# MODELS
+# =========================
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -65,7 +71,9 @@ class PaymentTransaction(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# Agent packages
+# =========================
+# AGENTS
+# =========================
 AGENT_PACKAGES = {
     "iris": {
         "name": "IRIS",
@@ -87,10 +95,12 @@ AGENT_PACKAGES = {
     }
 }
 
-# Routes
+# =========================
+# ROUTES
+# =========================
 @api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
+async def api_home():
+    return {"message": "API Psicolfis Online"}
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
@@ -117,8 +127,6 @@ async def create_checkout_session(request: CheckoutRequest):
 
         agent = AGENT_PACKAGES[agent_id]
         amount = agent["price"]
-        success_url = f"{request.origin_url}/success?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{request.origin_url}/cancel"
 
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
@@ -131,8 +139,8 @@ async def create_checkout_session(request: CheckoutRequest):
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=success_url,
-            cancel_url=cancel_url,
+            success_url=f"{request.origin_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{request.origin_url}/cancel",
             metadata={
                 "agent_id": agent_id,
                 "agent_name": agent["name"],
@@ -152,6 +160,7 @@ async def create_checkout_session(request: CheckoutRequest):
                 "stripe_product_id": agent["stripe_product_id"]
             }
         )
+
         doc = transaction.model_dump()
         doc['created_at'] = doc['created_at'].isoformat()
         doc['updated_at'] = doc['updated_at'].isoformat()
@@ -167,16 +176,16 @@ async def create_checkout_session(request: CheckoutRequest):
 async def get_checkout_status(session_id: str):
     try:
         session = stripe.checkout.Session.retrieve(session_id)
+
         if session.payment_status == "paid":
-            existing = await db.payment_transactions.find_one({"session_id": session_id})
-            if existing and existing.get("payment_status") != "paid":
-                await db.payment_transactions.update_one(
-                    {"session_id": session_id},
-                    {"$set": {
-                        "payment_status": "paid",
-                        "updated_at": datetime.now(timezone.utc).isoformat()
-                    }}
-                )
+            await db.payment_transactions.update_one(
+                {"session_id": session_id},
+                {"$set": {
+                    "payment_status": "paid",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }}
+            )
+
         return {
             "status": session.status,
             "payment_status": session.payment_status,
@@ -184,6 +193,7 @@ async def get_checkout_status(session_id: str):
             "currency": session.currency,
             "metadata": session.metadata
         }
+
     except Exception as e:
         logger.error(f"Error checking payment status: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -209,7 +219,6 @@ async def stripe_webhook(request: Request):
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }}
             )
-            logger.info(f"Webhook processed for session {session['id']}")
 
         return {"status": "success"}
 
@@ -217,7 +226,9 @@ async def stripe_webhook(request: Request):
         logger.error(f"Webhook error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# Middleware and shutdown
+# =========================
+# REGISTER ROUTER & CORS
+# =========================
 app.include_router(api_router)
 
 app.add_middleware(
