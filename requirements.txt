@@ -1,7 +1,7 @@
 fastapi==0.110.1
 starlette==0.37.2
 pydantic==2.12.5
-pydantic-core==2.41.0
+pydantic-core==2.41.5
 
 uvicorn==0.29.0
 gunicorn==21.2.0
