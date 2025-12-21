@@ -171,6 +171,9 @@ async def create_checkout_session(request: CheckoutRequest):
     except Exception as e:
         logger.error(f"Error creating checkout session: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+@api_router.get("/status")
+async def get_status_checks():
+    return {"message": "Status route reached"}
 
 @api_router.get("/checkout/status/{session_id}")
 async def get_checkout_status(session_id: str):
