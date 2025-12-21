@@ -30,6 +30,11 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+from fastapi.responses import RedirectResponse
+
+@app.get("/")
+async def redirect_to_api():
+    return RedirectResponse(url="/api/")
 
 # FastAPI app and router
 app = FastAPI()
